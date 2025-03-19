@@ -94,4 +94,4 @@ If you modify `/sda1/data/basic/somefile.txt` and add `/sda1/data/basic/newfile.
   ```
 - **Security**: The mismatch is detected due to SHA-256 sensitivity, and the encrypted `.db.json` ensures the stored hash is trustworthy.
 
-This design makes the program suitable for monitoring critical system files while providing visibility into filesystem changes without overloading the user with unnecessary failures for new files. Let me know if you'd like a deeper dive into any aspect!
+This design makes the program suitable for monitoring critical system files while providing visibility into filesystem changes without overloading the user with unnecessary failures for new files.
