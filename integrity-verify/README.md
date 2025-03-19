@@ -1,6 +1,4 @@
-Below is a detailed `README.md` for your `integrityx` project, covering the requested sections: Purpose, Key Components, Main Workflow, Security Features, and Example Scenario.
 
-```markdown
 # IntegrityX - File Integrity Verification Tool
 
 ## Purpose
@@ -200,4 +198,3 @@ integrityx ops /sda1/data/.gems.jpeg -db /sda1/data/apps/.db.json dec
 
 # Encrypt .db.json
 integrityx ops /sda1/data/.gems.jpeg -db /sda1/data/apps/.db.json enc
-```
