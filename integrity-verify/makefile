@@ -1,4 +1,4 @@
-APP_NAME = file_integrity_check
+APP_NAME = integrityx
 GO_FILES = $(wildcard *.go)
 OUTPUT_DIR = .
 
@@ -8,8 +8,9 @@ all: $(OUTPUT_DIR)/$(APP_NAME)
 
 $(OUTPUT_DIR)/$(APP_NAME): $(GO_FILES)
 	@mkdir -p $(OUTPUT_DIR)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o $(OUTPUT_DIR)/$(APP_NAME) .
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o $(OUTPUT_DIR)/$(APP_NAME) .
+	strip $(OUTPUT_DIR)/$(APP_NAME)
 
 clean:
-	rm -rf $(APP_NAME)
+	rm -rf $(OUTPUT_DIR)/$(APP_NAME)
 

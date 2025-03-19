@@ -3,9 +3,11 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jung-kurt/gofpdf"
+	"gopkg.in/ini.v1"
 )
 
 type FileHash struct {
@@ -22,7 +25,6 @@ type FileHash struct {
 	Hash string `json:"hash"`
 }
 
-// ReportEntry holds verification details for the PDF report
 type ReportEntry struct {
 	Directory string
 	Status    string
@@ -31,40 +33,67 @@ type ReportEntry struct {
 }
 
 func remountSDA1RW() error {
+	fmt.Println("Remounting /sda1 as read-write")
 	cmd := exec.Command("mount", "-o", "remount,rw", "/sda1")
 	return cmd.Run()
 }
 
 func remountSDA1RO() {
+	fmt.Println("Remounting /sda1 as read-only")
 	cmd := exec.Command("mount", "-o", "remount,ro", "/sda1")
 	cmd.Run()
 }
 
 func extractKeyFromImage(imagePath string) ([]byte, error) {
+	fmt.Printf("Extracting key from image: %s\n", imagePath)
 	tempKeyFile := "extracted_key.txt"
 	cmd := exec.Command("steghide", "extract", "-sf", imagePath, "-xf", tempKeyFile, "-p", "")
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("steghide extraction failed: %v", err)
 	}
 	defer os.Remove(tempKeyFile)
-
-	return os.ReadFile(tempKeyFile)
+	key, err := os.ReadFile(tempKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read extracted key: %v", err)
+	}
+	return key, nil
 }
 
-func decryptFile(key []byte, filePath string) ([]byte, error) {
-	ciphertext, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, err
-	}
-
+func encryptFile(key, plaintext []byte) ([]byte, error) {
+	fmt.Println("Encrypting data")
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create AES cipher: %v", err)
 	}
 
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create GCM: %v", err)
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("failed to generate nonce: %v", err)
+	}
+
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+func decryptFile(key []byte, filePath string) ([]byte, error) {
+	fmt.Printf("Decrypting file: %s\n", filePath)
+	ciphertext, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %v", err)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES cipher: %v", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM: %v", err)
 	}
 
 	nonceSize := gcm.NonceSize()
@@ -73,7 +102,11 @@ func decryptFile(key []byte, filePath string) ([]byte, error) {
 	}
 
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %v", err)
+	}
+	return plaintext, nil
 }
 
 func calculateFileHash(filePath string) (string, error) {
@@ -95,7 +128,6 @@ func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 	dbPath := filepath.Join(dirPath, ".db.json")
 	entry := ReportEntry{Directory: dirPath}
 
-	// Decrypt the hash database
 	decryptedData, err := decryptFile(key, dbPath)
 	if err != nil {
 		entry.Status = "Error"
@@ -103,7 +135,6 @@ func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 		return false, entry, err
 	}
 
-	// Parse the stored hashes
 	var storedHashes []FileHash
 	if err := json.Unmarshal(decryptedData, &storedHashes); err != nil {
 		entry.Status = "Error"
@@ -111,39 +142,38 @@ func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 		return false, entry, err
 	}
 
-	// Create a map of stored paths for quick lookup
-	storedPaths := make(map[string]bool)
+	storedPaths := make(map[string]string) // Map of path to hash
 	for _, h := range storedHashes {
-		storedPaths[h.Path] = true
+		storedPaths[h.Path] = h.Hash
 	}
 
-	// Verify existing files
 	allMatch := true
-	for _, storedHash := range storedHashes {
-		currentHash, err := calculateFileHash(storedHash.Path)
+
+	// Check for missing files and hash mismatches
+	for path, storedHash := range storedPaths {
+		currentHash, err := calculateFileHash(path)
 		if err != nil {
 			if os.IsNotExist(err) {
-				detail := fmt.Sprintf("File missing: %s", storedHash.Path)
+				detail := fmt.Sprintf("File missing: %s", path)
 				fmt.Println(detail)
 				entry.Details = append(entry.Details, detail)
 				allMatch = false
 				continue
 			}
 			entry.Status = "Error"
-			entry.Details = append(entry.Details, fmt.Sprintf("Failed to calculate hash for %s: %v", storedHash.Path, err))
+			entry.Details = append(entry.Details, fmt.Sprintf("Failed to calculate hash for %s: %v", path, err))
 			return false, entry, err
 		}
 
-		if currentHash != storedHash.Hash {
-			detail := fmt.Sprintf("Hash mismatch for %s\n  Stored: %s\n  Current: %s", storedHash.Path, storedHash.Hash, currentHash)
+		if currentHash != storedHash {
+			detail := fmt.Sprintf("Hash mismatch for %s\n  Stored: %s\n  Current: %s", path, storedHash, currentHash)
 			fmt.Println(detail)
 			entry.Details = append(entry.Details, detail)
 			allMatch = false
 		}
 	}
 
-	// Check for new files (informational only)
-	newFilesFound := false
+	// Check for unauthorized new files
 	err = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -152,10 +182,12 @@ func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 			return filepath.SkipDir
 		}
 		if !info.IsDir() && path != dbPath {
-			if !storedPaths[path] {
-				fmt.Printf("New file added: %s\n", path)
+			if _, exists := storedPaths[path]; !exists {
+				detail := fmt.Sprintf("Unauthorized new file detected: %s", path)
+				fmt.Println(detail)
+				entry.Details = append(entry.Details, detail)
 				entry.NewFiles = append(entry.NewFiles, path)
-				newFilesFound = true
+				allMatch = false
 			}
 		}
 		return nil
@@ -166,19 +198,142 @@ func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 		return false, entry, err
 	}
 
-	if newFilesFound {
-		fmt.Println("Note: New files detected, but this does not affect the integrity check of original files.")
-	}
-
 	if allMatch {
 		entry.Status = "Success"
-		fmt.Printf("All original files in %s verified successfully\n", dirPath)
+		fmt.Printf("All files in %s verified successfully - no unauthorized changes or additions\n", dirPath)
 	} else {
 		entry.Status = "Failed"
-		fmt.Printf("Integrity check failed for original files in %s\n", dirPath)
+		fmt.Printf("Integrity check failed for %s\n", dirPath)
 	}
 
 	return allMatch, entry, nil
+}
+
+func updateDirectory(key []byte, updateFile string) error {
+	fmt.Println("Starting directory update process")
+	if err := remountSDA1RW(); err != nil {
+		return fmt.Errorf("failed to remount /sda1 as read-write: %v", err)
+	}
+	defer remountSDA1RO()
+
+	fmt.Printf("Loading update file: %s\n", updateFile)
+	cfg, err := ini.Load(updateFile)
+	if err != nil {
+		return fmt.Errorf("failed to read update.ini: %v", err)
+	}
+
+	for _, section := range cfg.Sections() {
+		if section.Name() == "DEFAULT" {
+			continue
+		}
+		dirPath := section.Name()
+		dbPath := filepath.Join(dirPath, ".db.json")
+		fmt.Printf("Processing directory: %s\n", dirPath)
+
+		var existingHashes []FileHash
+		if _, err := os.Stat(dbPath); err == nil {
+			decryptedData, err := decryptFile(key, dbPath)
+			if err != nil {
+				return fmt.Errorf("failed to decrypt existing .db.json for %s: %v", dirPath, err)
+			}
+			if err := json.Unmarshal(decryptedData, &existingHashes); err != nil {
+				return fmt.Errorf("failed to parse existing .db.json for %s: %v", dirPath, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to check .db.json existence for %s: %v", dirPath, err)
+		}
+
+		hashMap := make(map[string]string)
+		for _, h := range existingHashes {
+			hashMap[h.Path] = h.Hash
+		}
+
+		for _, key := range section.Keys() {
+			filePath := filepath.Join(dirPath, key.Name())
+			hashValue := key.Value()
+
+			if hashValue == "REMOVE" {
+				if _, exists := hashMap[filePath]; exists {
+					delete(hashMap, filePath)
+					fmt.Printf("Removed file from hash database: %s\n", filePath)
+				}
+			} else {
+				hashMap[filePath] = hashValue
+				fmt.Printf("Updated/Added file in hash database: %s\n", filePath)
+			}
+		}
+
+		var updatedHashes []FileHash
+		for path, hash := range hashMap {
+			updatedHashes = append(updatedHashes, FileHash{
+				Path: path,
+				Hash: hash,
+			})
+		}
+
+		jsonData, err := json.Marshal(updatedHashes)
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON for %s: %v", dirPath, err)
+		}
+
+		encryptedData, err := encryptFile(key, jsonData)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt data for %s: %v", dirPath, err)
+		}
+
+		fmt.Printf("Writing updated .db.json to %s\n", dbPath)
+		if err := os.WriteFile(dbPath, encryptedData, 0644); err != nil {
+			return fmt.Errorf("failed to write .db.json for %s: %v", dirPath, err)
+		}
+		fmt.Printf("Updated hash database for %s\n", dirPath)
+	}
+	return nil
+}
+
+func opsCommand(imagePath, dbPath, operation string) error {
+	key, err := extractKeyFromImage(imagePath)
+	if err != nil {
+		return fmt.Errorf("failed to extract key: %v", err)
+	}
+
+	switch operation {
+	case "dec":
+		plaintext, err := decryptFile(key, dbPath)
+		if err != nil {
+			return fmt.Errorf("decryption failed: %v", err)
+		}
+		// Write decrypted content to a new file with .dec suffix
+		outputPath := dbPath + ".dec"
+		if err := os.WriteFile(outputPath, plaintext, 0644); err != nil {
+			return fmt.Errorf("failed to write decrypted file: %v", err)
+		}
+		fmt.Printf("Decrypted .db.json saved to %s\n", outputPath)
+
+	case "enc":
+		// Read the plain JSON file (assuming it's the decrypted version)
+		plaintext, err := os.ReadFile(dbPath)
+		if err != nil {
+			return fmt.Errorf("failed to read file for encryption: %v", err)
+		}
+		// Validate it's valid JSON
+		var temp []FileHash
+		if err := json.Unmarshal(plaintext, &temp); err != nil {
+			return fmt.Errorf("invalid JSON format: %v", err)
+		}
+		encryptedData, err := encryptFile(key, plaintext)
+		if err != nil {
+			return fmt.Errorf("encryption failed: %v", err)
+		}
+		// Write encrypted content back to the original file
+		if err := os.WriteFile(dbPath, encryptedData, 0644); err != nil {
+			return fmt.Errorf("failed to write encrypted file: %v", err)
+		}
+		fmt.Printf("Encrypted .db.json saved to %s\n", dbPath)
+
+	default:
+		return fmt.Errorf("invalid operation: %s (must be 'enc' or 'dec')", operation)
+	}
+	return nil
 }
 
 func getCurrentIP() string {
@@ -246,9 +401,9 @@ func generatePDFReport(entries []ReportEntry, allValid bool) error {
 	pdf.Ln(8)
 	pdf.SetFont("Arial", "", 12)
 	if allValid {
-		pdf.Cell(0, 10, "All directories' original files verified successfully")
+		pdf.Cell(0, 10, "All directories verified successfully - no unauthorized changes or additions")
 	} else {
-		pdf.Cell(0, 10, "Verification failed for one or more directories' original files")
+		pdf.Cell(0, 10, "Verification failed - unauthorized changes or additions detected in one or more directories")
 	}
 
 	outputPath := fmt.Sprintf("/tmp/file_integrity_report_%s.pdf", time.Now().Format("20060102_150405"))
@@ -257,59 +412,118 @@ func generatePDFReport(entries []ReportEntry, allValid bool) error {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: ./file_verifier <image_path>")
-		return
-	}
-	imagePath := os.Args[1]
-
-	// Extract encryption key from image
-	key, err := extractKeyFromImage(imagePath)
-	if err != nil {
-		fmt.Println("Error extracting key from image:", err)
+		fmt.Println("Usage:")
+		fmt.Println("  integrityx verify <image-path>")
+		fmt.Println("  integrityx update <image-path> -f <update.ini>")
+		fmt.Println("  integrityx ops <image-path> -db <path-of-.db.json> enc|dec")
 		return
 	}
 
-	if err := remountSDA1RW(); err != nil {
-		fmt.Println("Error remounting /sda1:", err)
-		remountSDA1RO()
-		return
-	}
-	defer remountSDA1RO()
+	command := os.Args[1]
 
-	directories := []string{
-		"/sda1/data/apps/",
-		"/sda1/data/basic/",
-		"/sda1/data/core/",
-		"/sda1/boot/",
-	}
+	switch command {
+	case "verify":
+		if len(os.Args) != 3 {
+			fmt.Println("Usage: integrityx verify <image-path>")
+			return
+		}
+		imagePath := os.Args[2]
 
-	var reportEntries []ReportEntry
-	allValid := true
-	for _, dir := range directories {
-		fmt.Printf("\nVerifying directory: %s\n", dir)
-		valid, entry, err := verifyDirectory(key, dir)
+		key, err := extractKeyFromImage(imagePath)
 		if err != nil {
-			fmt.Printf("Error verifying %s: %v\n", dir, err)
+			fmt.Println("Error extracting key from image:", err)
+			return
+		}
+
+		if err := remountSDA1RW(); err != nil {
+			fmt.Println("Error remounting /sda1:", err)
+			remountSDA1RO()
+			return
+		}
+		defer remountSDA1RO()
+
+		directories := []string{
+			"/sda1/data/apps/",
+			"/sda1/data/basic/",
+			"/sda1/data/core/",
+			"/sda1/boot/",
+		}
+
+		var reportEntries []ReportEntry
+		allValid := true
+		for _, dir := range directories {
+			fmt.Printf("\nVerifying directory: %s\n", dir)
+			valid, entry, err := verifyDirectory(key, dir)
+			if err != nil {
+				fmt.Printf("Error verifying %s: %v\n", dir, err)
+				reportEntries = append(reportEntries, entry)
+				allValid = false
+				continue
+			}
 			reportEntries = append(reportEntries, entry)
-			allValid = false
-			continue
+			if !valid {
+				allValid = false
+			}
 		}
-		reportEntries = append(reportEntries, entry)
-		if !valid {
-			allValid = false
+
+		if allValid {
+			fmt.Println("\nAll directories verified successfully - no unauthorized changes or additions")
+		} else {
+			fmt.Println("\nVerification failed - unauthorized changes or additions detected in one or more directories")
 		}
-	}
 
-	if allValid {
-		fmt.Println("\nAll directories' original files verified successfully")
-	} else {
-		fmt.Println("\nVerification failed for one or more directories' original files")
-	}
+		if err := generatePDFReport(reportEntries, allValid); err != nil {
+			fmt.Println("Error generating PDF report:", err)
+		} else {
+			fmt.Printf("PDF report saved to /tmp/file_integrity_report_%s.pdf\n", time.Now().Format("20060102_150405"))
+		}
 
-	// Generate PDF report
-	if err := generatePDFReport(reportEntries, allValid); err != nil {
-		fmt.Println("Error generating PDF report:", err)
-	} else {
-		fmt.Printf("PDF report saved to /tmp/file_integrity_report_%s.pdf\n", time.Now().Format("20060102_150405"))
+	case "update":
+		updateCmd := flag.NewFlagSet("update", flag.ExitOnError)
+		updateFile := updateCmd.String("f", "", "Path to update.ini file")
+		updateCmd.Parse(os.Args[3:])
+
+		if len(os.Args) < 3 || *updateFile == "" {
+			fmt.Println("Usage: integrityx update <image-path> -f <update.ini>")
+			return
+		}
+
+		imagePath := os.Args[2]
+		key, err := extractKeyFromImage(imagePath)
+		if err != nil {
+			fmt.Println("Error extracting key from image:", err)
+			return
+		}
+
+		if err := updateDirectory(key, *updateFile); err != nil {
+			fmt.Println("Error updating directories:", err)
+			return
+		}
+		fmt.Println("Directory hash databases updated successfully")
+
+	case "ops":
+		opsCmd := flag.NewFlagSet("ops", flag.ExitOnError)
+		dbPath := opsCmd.String("db", "", "Path to .db.json file")
+		opsCmd.Parse(os.Args[3:])
+
+		if len(os.Args) < 5 || *dbPath == "" || (os.Args[len(os.Args)-1] != "enc" && os.Args[len(os.Args)-1] != "dec") {
+			fmt.Println("Usage: integrityx ops <image-path> -db <path-of-.db.json> enc|dec")
+			return
+		}
+
+		imagePath := os.Args[2]
+		operation := os.Args[len(os.Args)-1]
+
+		if err := opsCommand(imagePath, *dbPath, operation); err != nil {
+			fmt.Println("Error performing ops command:", err)
+			return
+		}
+
+	default:
+		fmt.Println("Unknown command:", command)
+		fmt.Println("Usage:")
+		fmt.Println("  integrityx verify <image-path>")
+		fmt.Println("  integrityx update <image-path> -f <update.ini>")
+		fmt.Println("  integrityx ops <image-path> -db <path-of-.db.json> enc|dec")
 	}
 }
