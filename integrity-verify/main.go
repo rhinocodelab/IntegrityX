@@ -8,14 +8,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
+
+	"github.com/jung-kurt/gofpdf"
 )
 
 type FileHash struct {
 	Path string `json:"path"`
 	Hash string `json:"hash"`
+}
+
+// ReportEntry holds verification details for the PDF report
+type ReportEntry struct {
+	Directory string
+	Status    string
+	Details   []string
+	NewFiles  []string
 }
 
 func remountSDA1RW() error {
@@ -79,19 +91,24 @@ func calculateFileHash(filePath string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func verifyDirectory(key []byte, dirPath string) (bool, error) {
+func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 	dbPath := filepath.Join(dirPath, ".db.json")
+	entry := ReportEntry{Directory: dirPath}
 
 	// Decrypt the hash database
 	decryptedData, err := decryptFile(key, dbPath)
 	if err != nil {
-		return false, fmt.Errorf("failed to decrypt .db.json: %v", err)
+		entry.Status = "Error"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to decrypt .db.json: %v", err))
+		return false, entry, err
 	}
 
 	// Parse the stored hashes
 	var storedHashes []FileHash
 	if err := json.Unmarshal(decryptedData, &storedHashes); err != nil {
-		return false, fmt.Errorf("failed to parse .db.json: %v", err)
+		entry.Status = "Error"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to parse .db.json: %v", err))
+		return false, entry, err
 	}
 
 	// Create a map of stored paths for quick lookup
@@ -106,16 +123,21 @@ func verifyDirectory(key []byte, dirPath string) (bool, error) {
 		currentHash, err := calculateFileHash(storedHash.Path)
 		if err != nil {
 			if os.IsNotExist(err) {
-				fmt.Printf("File missing: %s\n", storedHash.Path)
+				detail := fmt.Sprintf("File missing: %s", storedHash.Path)
+				fmt.Println(detail)
+				entry.Details = append(entry.Details, detail)
 				allMatch = false
 				continue
 			}
-			return false, fmt.Errorf("failed to calculate hash for %s: %v", storedHash.Path, err)
+			entry.Status = "Error"
+			entry.Details = append(entry.Details, fmt.Sprintf("Failed to calculate hash for %s: %v", storedHash.Path, err))
+			return false, entry, err
 		}
 
 		if currentHash != storedHash.Hash {
-			fmt.Printf("Hash mismatch for %s\n", storedHash.Path)
-			fmt.Printf("Stored: %s\nCurrent: %s\n", storedHash.Hash, currentHash)
+			detail := fmt.Sprintf("Hash mismatch for %s\n  Stored: %s\n  Current: %s", storedHash.Path, storedHash.Hash, currentHash)
+			fmt.Println(detail)
+			entry.Details = append(entry.Details, detail)
 			allMatch = false
 		}
 	}
@@ -132,20 +154,105 @@ func verifyDirectory(key []byte, dirPath string) (bool, error) {
 		if !info.IsDir() && path != dbPath {
 			if !storedPaths[path] {
 				fmt.Printf("New file added: %s\n", path)
+				entry.NewFiles = append(entry.NewFiles, path)
 				newFilesFound = true
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return false, fmt.Errorf("failed to scan directory: %v", err)
+		entry.Status = "Error"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to scan directory: %v", err))
+		return false, entry, err
 	}
 
 	if newFilesFound {
 		fmt.Println("Note: New files detected, but this does not affect the integrity check of original files.")
 	}
 
-	return allMatch, nil
+	if allMatch {
+		entry.Status = "Success"
+		fmt.Printf("All original files in %s verified successfully\n", dirPath)
+	} else {
+		entry.Status = "Failed"
+		fmt.Printf("Integrity check failed for original files in %s\n", dirPath)
+	}
+
+	return allMatch, entry, nil
+}
+
+func getCurrentIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "Unknown (error retrieving IP)"
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			return ipnet.IP.String()
+		}
+	}
+	return "Unknown (no suitable IP found)"
+}
+
+func generatePDFReport(entries []ReportEntry, allValid bool) error {
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	pdf.AddPage()
+	pdf.SetFont("Arial", "B", 16)
+	pdf.Cell(0, 10, "CloudX File Integrity Verification Report")
+	pdf.Ln(15)
+
+	pdf.SetFont("Arial", "", 12)
+	pdf.Cell(0, 10, fmt.Sprintf("Date: %s", time.Now().Format(time.RFC1123)))
+	pdf.Ln(8)
+	pdf.Cell(0, 10, fmt.Sprintf("IP Address: %s", getCurrentIP()))
+	pdf.Ln(8)
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "Unknown (error retrieving hostname)"
+	}
+	pdf.Cell(0, 10, fmt.Sprintf("Hostname: %s", hostname))
+	pdf.Ln(10)
+
+	for _, entry := range entries {
+		pdf.SetFont("Arial", "B", 14)
+		pdf.Cell(0, 10, fmt.Sprintf("Directory: %s", entry.Directory))
+		pdf.Ln(8)
+
+		pdf.SetFont("Arial", "", 12)
+		pdf.Cell(0, 10, fmt.Sprintf("Status: %s", entry.Status))
+		pdf.Ln(8)
+
+		if len(entry.Details) > 0 {
+			pdf.Cell(0, 10, "Details:")
+			pdf.Ln(6)
+			for _, detail := range entry.Details {
+				pdf.MultiCell(0, 6, fmt.Sprintf("- %s", detail), "", "", false)
+			}
+		}
+
+		if len(entry.NewFiles) > 0 {
+			pdf.Ln(4)
+			pdf.Cell(0, 10, "New Files Detected:")
+			pdf.Ln(6)
+			for _, newFile := range entry.NewFiles {
+				pdf.MultiCell(0, 6, fmt.Sprintf("- %s", newFile), "", "", false)
+			}
+		}
+		pdf.Ln(10)
+	}
+
+	pdf.SetFont("Arial", "B", 14)
+	pdf.Cell(0, 10, "Summary")
+	pdf.Ln(8)
+	pdf.SetFont("Arial", "", 12)
+	if allValid {
+		pdf.Cell(0, 10, "All directories' original files verified successfully")
+	} else {
+		pdf.Cell(0, 10, "Verification failed for one or more directories' original files")
+	}
+
+	outputPath := fmt.Sprintf("/tmp/file_integrity_report_%s.pdf", time.Now().Format("20060102_150405"))
+	return pdf.OutputFileAndClose(outputPath)
 }
 
 func main() {
@@ -176,19 +283,19 @@ func main() {
 		"/sda1/boot/",
 	}
 
+	var reportEntries []ReportEntry
 	allValid := true
 	for _, dir := range directories {
 		fmt.Printf("\nVerifying directory: %s\n", dir)
-		valid, err := verifyDirectory(key, dir)
+		valid, entry, err := verifyDirectory(key, dir)
 		if err != nil {
 			fmt.Printf("Error verifying %s: %v\n", dir, err)
+			reportEntries = append(reportEntries, entry)
 			allValid = false
 			continue
 		}
-		if valid {
-			fmt.Printf("All original files in %s verified successfully\n", dir)
-		} else {
-			fmt.Printf("Integrity check failed for original files in %s\n", dir)
+		reportEntries = append(reportEntries, entry)
+		if !valid {
 			allValid = false
 		}
 	}
@@ -197,5 +304,12 @@ func main() {
 		fmt.Println("\nAll directories' original files verified successfully")
 	} else {
 		fmt.Println("\nVerification failed for one or more directories' original files")
+	}
+
+	// Generate PDF report
+	if err := generatePDFReport(reportEntries, allValid); err != nil {
+		fmt.Println("Error generating PDF report:", err)
+	} else {
+		fmt.Printf("PDF report saved to /tmp/file_integrity_report_%s.pdf\n", time.Now().Format("20060102_150405"))
 	}
 }
