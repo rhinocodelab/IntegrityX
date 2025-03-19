@@ -21,6 +21,19 @@ Key purposes:
 2. **Configuration File (`update.ini`)**:
    - An INI-formatted file specifying directories and file hashes to update in `.db.json`.
    - Supports adding new files, updating existing file hashes, and removing file entries.
+   - **Format**:
+     - Sections are directory paths (e.g., `[/sda1/data/apps/]`) enclosed in square brackets.
+     - Keys are file names (relative to the section’s directory).
+     - Values are either SHA-256 hashes (64 hexadecimal characters) or the keyword `REMOVE` to delete an entry.
+   - **Example `update.ini`**:
+   
+   [/sda1/data/apps/]
+   file1.txt = 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+   test.sq = abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+   oldfile.sq = REMOVE
+
+   [/sda1/data/core/]
+   core.sq = fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
 
 3. **Hash Database (`.db.json`)**:
    - An encrypted JSON file stored in each monitored directory (e.g., `/sda1/data/apps/.db.json`).
