@@ -37,6 +37,12 @@ type ReportEntry struct {
 	NewFiles  []string
 }
 
+type UpdateReportEntry struct {
+	Directory string
+	Status    string // "Success" or "Failed"
+	Details   []string
+}
+
 func remountSDA1RW() error {
 	fmt.Println("Remounting /sda1 as read-write")
 	cmd := exec.Command("mount", "-o", "remount,rw", "/sda1")
@@ -267,118 +273,141 @@ func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 	return allMatch, entry, nil
 }
 
-func updateDirectory(key []byte, updateFile string) error {
-	fmt.Println("Starting directory update process")
-	if err := remountSDA1RW(); err != nil {
-		return fmt.Errorf("failed to remount /sda1 as read-write: %v", err)
-	}
-	defer remountSDA1RO()
+func updateDirectory(key []byte, dirPath string, cfg *ini.File) (UpdateReportEntry, error) {
+	entry := UpdateReportEntry{Directory: dirPath}
+	dbPath := filepath.Join(dirPath, ".db.json")
+	baseName := filepath.Base(dirPath)
+	hashFilePath := filepath.Join(dirPath, fmt.Sprintf(".%s.json", baseName))
+	fmt.Printf("Processing directory: %s\n", dirPath)
 
-	fmt.Printf("Loading update file: %s\n", updateFile)
-	cfg, err := ini.Load(updateFile)
-	if err != nil {
-		return fmt.Errorf("failed to read update.ini: %v", err)
-	}
-
-	for _, section := range cfg.Sections() {
-		if section.Name() == "DEFAULT" {
-			continue
+	// Load existing .db.json if it exists
+	var existingHashes []FileHash
+	if _, err := os.Stat(dbPath); err == nil {
+		decryptedData, err := decryptFile(key, dbPath)
+		if err != nil {
+			entry.Status = "Failed"
+			entry.Details = append(entry.Details, fmt.Sprintf("Failed to decrypt .db.json: %v", err))
+			return entry, err
 		}
-		dirPath := section.Name()
-		dbPath := filepath.Join(dirPath, ".db.json")
-		baseName := filepath.Base(dirPath)
-		hashFilePath := filepath.Join(dirPath, fmt.Sprintf(".%s.json", baseName))
-		fmt.Printf("Processing directory: %s\n", dirPath)
+		if err = json.Unmarshal(decryptedData, &existingHashes); err != nil {
+			entry.Status = "Failed"
+			entry.Details = append(entry.Details, fmt.Sprintf("Failed to parse .db.json: %v", err))
+			return entry, err
+		}
+	} else if !os.IsNotExist(err) {
+		entry.Status = "Failed"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to check .db.json existence: %v", err))
+		return entry, err
+	}
 
-		// Load existing .db.json if it exists
-		var existingHashes []FileHash
-		if _, err := os.Stat(dbPath); err == nil {
-			decryptedData, err := decryptFile(key, dbPath)
+	// Update the hash map
+	hashMap := make(map[string]string)
+	for _, h := range existingHashes {
+		hashMap[h.Path] = h.Hash
+	}
+
+	// Process updates for this directory only
+	section := cfg.Section(dirPath)
+	for _, key := range section.Keys() {
+		filePath := filepath.Join(dirPath, key.Name())
+		hashValue := key.Value()
+
+		if hashValue == "REMOVE" {
+			if _, exists := hashMap[filePath]; exists {
+				delete(hashMap, filePath)
+				fmt.Printf("Removed file from hash database: %s\n", filePath)
+			}
+		} else {
+			actualHash, err := calculateFileHash(filePath)
 			if err != nil {
-				return fmt.Errorf("failed to decrypt existing .db.json for %s: %v", dirPath, err)
-			}
-			if err := json.Unmarshal(decryptedData, &existingHashes); err != nil {
-				return fmt.Errorf("failed to parse existing .db.json for %s: %v", dirPath, err)
-			}
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to check .db.json existence for %s: %v", dirPath, err)
-		}
-
-		// Update the hash map
-		hashMap := make(map[string]string)
-		for _, h := range existingHashes {
-			hashMap[h.Path] = h.Hash
-		}
-
-		for _, key := range section.Keys() {
-			filePath := filepath.Join(dirPath, key.Name())
-			hashValue := key.Value()
-
-			if hashValue == "REMOVE" {
-				if _, exists := hashMap[filePath]; exists {
-					delete(hashMap, filePath)
-					fmt.Printf("Removed file from hash database: %s\n", filePath)
+				if os.IsNotExist(err) {
+					entry.Status = "Failed"
+					entry.Details = append(entry.Details, fmt.Sprintf("File %s does not exist, cannot update hash", filePath))
+				} else {
+					entry.Status = "Failed"
+					entry.Details = append(entry.Details, fmt.Sprintf("Failed to calculate hash for %s: %v", filePath, err))
 				}
-			} else {
-				hashMap[filePath] = hashValue
-				fmt.Printf("Updated/Added file in hash database: %s\n", filePath)
+				return entry, err
 			}
+			fmt.Printf("Provided hash for %s: %s\n", filePath, hashValue)
+			fmt.Printf("Actual hash for %s: %s\n", filePath, actualHash)
+			if actualHash != hashValue {
+				entry.Status = "Failed"
+				entry.Details = append(entry.Details, fmt.Sprintf("Hash mismatch for %s\n  Provided: %s\n  Actual: %s", filePath, hashValue, actualHash))
+				return entry, fmt.Errorf("hash mismatch for %s", filePath)
+			}
+			hashMap[filePath] = hashValue
+			fmt.Printf("Verified and updated/added file in hash database: %s\n", filePath)
 		}
-		// Create updated .db.json
-		var updatedHashes []FileHash
-		for path, hash := range hashMap {
-			updatedHashes = append(updatedHashes, FileHash{
-				Path: path,
-				Hash: hash,
-			})
-		}
-
-		jsonData, err := json.Marshal(updatedHashes)
-		if err != nil {
-			return fmt.Errorf("failed to marshal JSON for %s: %v", dirPath, err)
-		}
-
-		encryptedData, err := encryptFile(key, jsonData)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt data for %s: %v", dirPath, err)
-		}
-
-		fmt.Printf("Writing updated .db.json to %s\n", dbPath)
-		if err := os.WriteFile(dbPath, encryptedData, 0644); err != nil {
-			return fmt.Errorf("failed to write .db.json for %s: %v", dirPath, err)
-		}
-
-		// Step 2: Update the corresponding .apps.json
-		// Calculate the new hash of the encrypted .db.json
-		newDBHash, err := calculateFileHash(dbPath)
-		if err != nil {
-			return fmt.Errorf("failed to calculate new hash for %s: %v", dbPath, err)
-		}
-		// Create the updated DBHash structure
-		dbHash := DBHash{
-			Path: dbPath,
-			Hash: newDBHash,
-		}
-		// Marshal to JSON
-		hashJsonData, err := json.MarshalIndent(dbHash, "", "  ")
-		if err != nil {
-			return fmt.Errorf("failed to marshal hash JSON for %s: %v", hashFilePath, err)
-		}
-
-		// Encrypt the new .apps.json content
-		encryptedHashData, err := encryptFile(key, hashJsonData)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt hash data for %s: %v", hashFilePath, err)
-		}
-
-		// Write the updated .apps.json
-		fmt.Printf("Writing updated %s with new .db.json hash\n", hashFilePath)
-		if err := os.WriteFile(hashFilePath, encryptedHashData, 0644); err != nil {
-			return fmt.Errorf("failed to write %s: %v", hashFilePath, err)
-		}
-		fmt.Printf("Updated hash database for %s\n", dirPath)
 	}
-	return nil
+
+	// Create updated .db.json
+	var updatedHashes []FileHash
+	for path, hash := range hashMap {
+		updatedHashes = append(updatedHashes, FileHash{
+			Path: path,
+			Hash: hash,
+		})
+	}
+
+	jsonData, err := json.Marshal(updatedHashes)
+	if err != nil {
+		entry.Status = "Failed"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to marshal JSON: %v", err))
+		return entry, err
+	}
+
+	encryptedData, err := encryptFile(key, jsonData)
+	if err != nil {
+		entry.Status = "Failed"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to encrypt data: %v", err))
+		return entry, err
+	}
+
+	fmt.Printf("Writing updated .db.json to %s\n", dbPath)
+	if err = os.WriteFile(dbPath, encryptedData, 0644); err != nil {
+		entry.Status = "Failed"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to write .db.json: %v", err))
+		return entry, err
+	}
+
+	// Update .apps.json
+	newDBHash, err := calculateFileHash(dbPath)
+	if err != nil {
+		entry.Status = "Failed"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to calculate new hash for .db.json: %v", err))
+		return entry, err
+	}
+
+	dbHash := DBHash{
+		Path: dbPath,
+		Hash: newDBHash,
+	}
+
+	hashJsonData, err := json.MarshalIndent(dbHash, "", "  ")
+	if err != nil {
+		entry.Status = "Failed"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to marshal hash JSON: %v", err))
+		return entry, err
+	}
+
+	encryptedHashData, err := encryptFile(key, hashJsonData)
+	if err != nil {
+		entry.Status = "Failed"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to encrypt hash data: %v", err))
+		return entry, err
+	}
+
+	fmt.Printf("Writing updated %s with new .db.json hash\n", hashFilePath)
+	if err = os.WriteFile(hashFilePath, encryptedHashData, 0644); err != nil {
+		entry.Status = "Failed"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to write %s: %v", hashFilePath, err))
+		return entry, err
+	}
+
+	entry.Status = "Success"
+	fmt.Printf("Updated hash database and hash file for %s\n", dirPath)
+	return entry, nil
 }
 
 func opsCommand(imagePath, dbPath, operation string) error {
@@ -501,6 +530,58 @@ func generatePDFReport(entries []ReportEntry, allValid bool) error {
 	return pdf.OutputFileAndClose(outputPath)
 }
 
+func generateUpdatePDFReport(entries []UpdateReportEntry, allSuccessful bool) error {
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	pdf.AddPage()
+	pdf.SetFont("Arial", "B", 16)
+	pdf.Cell(0, 10, "CloudX File Integrity Update Report")
+	pdf.Ln(15)
+
+	pdf.SetFont("Arial", "", 12)
+	pdf.Cell(0, 10, fmt.Sprintf("Date: %s", time.Now().Format(time.RFC1123)))
+	pdf.Ln(8)
+	pdf.Cell(0, 10, fmt.Sprintf("IP Address: %s", getCurrentIP()))
+	pdf.Ln(8)
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "Unknown (error retrieving hostname)"
+	}
+	pdf.Cell(0, 10, fmt.Sprintf("Hostname: %s", hostname))
+	pdf.Ln(10)
+
+	for _, entry := range entries {
+		pdf.SetFont("Arial", "B", 14)
+		pdf.Cell(0, 10, fmt.Sprintf("Directory: %s", entry.Directory))
+		pdf.Ln(8)
+
+		pdf.SetFont("Arial", "", 12)
+		pdf.Cell(0, 10, fmt.Sprintf("Status: %s", entry.Status))
+		pdf.Ln(8)
+
+		if len(entry.Details) > 0 {
+			pdf.Cell(0, 10, "Details:")
+			pdf.Ln(6)
+			for _, detail := range entry.Details {
+				pdf.MultiCell(0, 6, fmt.Sprintf("- %s", detail), "", "", false)
+			}
+		}
+		pdf.Ln(10)
+	}
+
+	pdf.SetFont("Arial", "B", 14)
+	pdf.Cell(0, 10, "Summary")
+	pdf.Ln(8)
+	pdf.SetFont("Arial", "", 12)
+	if allSuccessful {
+		pdf.Cell(0, 10, "All directories updated successfully")
+	} else {
+		pdf.Cell(0, 10, "Update failed for one or more directories")
+	}
+
+	outputPath := fmt.Sprintf("/tmp/update_report_%s.pdf", time.Now().Format("20060102_150405"))
+	return pdf.OutputFileAndClose(outputPath)
+}
+
 func cleanupTempFiles() {
 	files := []string{"extracted_key.txt"}
 	for _, file := range files {
@@ -589,20 +670,16 @@ func main() {
 			}
 		}
 		close(resultChan)
-		// for _, dir := range directories {
-		// 	fmt.Printf("\nVerifying directory: %s\n", dir)
-		// 	valid, entry, err := verifyDirectory(key, dir)
-		// 	if err != nil {
-		// 		fmt.Printf("Error verifying %s: %v\n", dir, err)
-		// 		reportEntries = append(reportEntries, entry)
-		// 		allValid = false
-		// 		continue
-		// 	}
-		// 	reportEntries = append(reportEntries, entry)
-		// 	if !valid {
-		// 		allValid = false
-		// 	}
-		// }
+
+		// Create hidden failure file if verification failed
+		if !allValid {
+			failureFile := "/tmp/.integrity_check_failed"
+			if err := os.WriteFile(failureFile, []byte(time.Now().Format(time.RFC1123)), 0644); err != nil {
+				fmt.Printf("Error creating %s: %v\n", failureFile, err)
+			} else {
+				fmt.Printf("Verification failed, created %s\n", failureFile)
+			}
+		}
 
 		if allValid {
 			fmt.Println("\nAll directories verified successfully - no unauthorized changes or additions")
@@ -633,6 +710,13 @@ func main() {
 			return
 		}
 
+		if err = remountSDA1RW(); err != nil { // Mount RW once before parallel updates
+			fmt.Println("Error remounting /sda1:", err)
+			remountSDA1RO()
+			return
+		}
+		defer remountSDA1RO()
+
 		cfg, err := ini.Load(*updateFile)
 		if err != nil {
 			fmt.Println("Error loading update.ini:", err)
@@ -640,30 +724,51 @@ func main() {
 		}
 
 		sections := cfg.Sections()
-		resultChan := make(chan error, len(sections)-1) // -1 to exclude DEFAULT
+		resultChan := make(chan struct {
+			Entry UpdateReportEntry
+			Err   error
+		}, len(sections)-1) // -1 to exclude DEFAULT
+
+		// Process each directory in parallel
 		for _, section := range sections {
 			if section.Name() == "DEFAULT" {
 				continue
 			}
 			go func(dirPath string) {
 				fmt.Printf("Processing directory: %s (in parallel)\n", dirPath)
-				err := updateDirectory(key, *updateFile) // Note: this updates all dirs; adjust if needed
-				resultChan <- err
+				entry, err := updateDirectory(key, dirPath, cfg)
+				resultChan <- struct {
+					Entry UpdateReportEntry
+					Err   error
+				}{Entry: entry, Err: err}
 			}(section.Name())
 		}
 
+		// Collect results
+		var reportEntries []UpdateReportEntry
+		allSuccessful := true
 		for i := 0; i < len(sections)-1; i++ {
-			if err := <-resultChan; err != nil {
-				fmt.Println("Error updating directory:", err)
-				return
+			result := <-resultChan
+			reportEntries = append(reportEntries, result.Entry)
+			if result.Err != nil {
+				fmt.Printf("Error updating %s: %v\n", result.Entry.Directory, result.Err)
+				allSuccessful = false
 			}
 		}
 		close(resultChan)
-		// if err := updateDirectory(key, *updateFile); err != nil {
-		// 	fmt.Println("Error updating directories:", err)
-		// 	return
-		// }
-		fmt.Println("Directory hash databases updated successfully")
+
+		// Generate PDF report
+		if err := generateUpdatePDFReport(reportEntries, allSuccessful); err != nil {
+			fmt.Println("Error generating PDF report:", err)
+		} else {
+			fmt.Printf("Update report saved to /tmp/update_report_%s.pdf\n", time.Now().Format("20060102_150405"))
+		}
+
+		if allSuccessful {
+			fmt.Println("Directory hash databases updated successfully")
+		} else {
+			fmt.Println("Update failed for one or more directories")
+		}
 
 	case "ops":
 		opsCmd := flag.NewFlagSet("ops", flag.ExitOnError)
