@@ -20,6 +20,42 @@ type FileHash struct {
 	Hash string `json:"hash"`
 }
 
+type DBHash struct {
+	Path string `json:"path"`
+	Hash string `json:"hash"`
+}
+
+func saveDBHash(dbPath string, key []byte) (string, error) {
+	hash, err := calculateFileHash(dbPath)
+	if err != nil {
+		return "", err
+	}
+
+	dir := filepath.Dir(dbPath)
+	baseName := filepath.Base(dir)
+	hashFileName := fmt.Sprintf(".%s.json", baseName)
+	hashFilePath := filepath.Join(dir, hashFileName)
+
+	dbHash := DBHash{
+		Path: dbPath,
+		Hash: hash,
+	}
+
+	jsonData, err := json.MarshalIndent(dbHash, "", "  ")
+	if err != nil {
+		return "", err
+	}
+
+	if err := os.WriteFile(hashFilePath, jsonData, 0644); err != nil {
+		return "", err
+	}
+
+	if err := encryptFile(key, hashFilePath); err != nil {
+		return "", err
+	}
+	return hashFilePath, nil
+}
+
 func remountSDA1RW() error {
 	cmd := exec.Command("mount", "-o", "remount,rw", "/sda1")
 	return cmd.Run()
@@ -154,7 +190,6 @@ func main() {
 		remountSDA1RO()
 		return
 	}
-
 	defer remountSDA1RO()
 
 	if len(os.Args) < 2 {
@@ -173,18 +208,6 @@ func main() {
 		fmt.Println("Error hiding key in image:", err)
 		return
 	}
-	directories := []string{
-		"/sda1/data/apps/",
-		"/sda1/data/basic/",
-		"/sda1/data/core/",
-		"/sda1/boot/",
-	}
-
-	for _, dir := range directories {
-		if err := scanAndSaveHashes(dir); err != nil {
-			fmt.Printf("Error processing %s: %v\n", dir, err)
-		}
-	}
 
 	keyFromImage, err := extractKeyFromImage(imagePath)
 	if err != nil {
@@ -192,12 +215,71 @@ func main() {
 		return
 	}
 
-	for _, dir := range directories {
-		dbPath := filepath.Join(dir, ".db.json")
-		if err := encryptFile(keyFromImage, dbPath); err != nil {
-			fmt.Printf("Error encrypting %s: %v\n", dbPath, err)
-		}
+	directories := []string{
+		"/sda1/data/apps/",
+		"/sda1/data/basic/",
+		"/sda1/data/core/",
+		"/sda1/boot/",
 	}
 
-	createFlagFile()
+	// Channel to collect errors from goroutines
+	type Result struct {
+		Dir string
+		Err error
+	}
+	resultChan := make(chan Result, len(directories))
+
+	// Semaphore to limit concurrency (e.g., 2 concurrent tasks)
+	sem := make(chan struct{}, 2)
+
+	// Process each directory in parallel
+	for _, dir := range directories {
+		go func(dir string) {
+			sem <- struct{}{}        // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			fmt.Printf("Processing directory: %s (in parallel)\n", dir)
+
+			// Step 1: Scan and save hashes
+			if err := scanAndSaveHashes(dir); err != nil {
+				resultChan <- Result{Dir: dir, Err: fmt.Errorf("error scanning %s: %v", dir, err)}
+				return
+			}
+
+			// Step 2: Encrypt .db.json
+			dbPath := filepath.Join(dir, ".db.json")
+			if err := encryptFile(keyFromImage, dbPath); err != nil {
+				resultChan <- Result{Dir: dir, Err: fmt.Errorf("error encrypting %s: %v", dbPath, err)}
+				return
+			}
+
+			// Step 3: Save and encrypt hash file
+			hashFilePath, err := saveDBHash(dbPath, keyFromImage)
+			if err != nil {
+				resultChan <- Result{Dir: dir, Err: fmt.Errorf("error saving/encrypting hash file for %s: %v", dbPath, err)}
+				return
+			}
+
+			resultChan <- Result{Dir: dir, Err: nil}
+			fmt.Printf("Successfully created and encrypted %s\n", hashFilePath)
+		}(dir)
+	}
+
+	// Collect results
+	success := true
+	for i := 0; i < len(directories); i++ {
+		res := <-resultChan
+		if res.Err != nil {
+			fmt.Println(res.Err)
+			success = false
+		}
+	}
+	close(resultChan)
+
+	if success {
+		fmt.Println("All directories processed successfully")
+		createFlagFile()
+	} else {
+		fmt.Println("Some directories failed to process")
+	}
 }

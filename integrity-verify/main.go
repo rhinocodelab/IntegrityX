@@ -20,6 +20,11 @@ import (
 	"gopkg.in/ini.v1"
 )
 
+type DBHash struct {
+	Path string `json:"path"`
+	Hash string `json:"hash"`
+}
+
 type FileHash struct {
 	Path string `json:"path"`
 	Hash string `json:"hash"`
@@ -126,8 +131,63 @@ func calculateFileHash(filePath string) (string, error) {
 
 func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 	dbPath := filepath.Join(dirPath, ".db.json")
+	baseName := filepath.Base(dirPath)
+	hashFilePath := filepath.Join(dirPath, fmt.Sprintf(".%s.json", baseName))
 	entry := ReportEntry{Directory: dirPath}
 
+	allMatch := true
+
+	// Step 1: Verify the .apps.json file
+	if _, err := os.Stat(hashFilePath); err == nil {
+		// Decrypt .apps.json
+		decryptedHashData, err := decryptFile(key, hashFilePath)
+		if err != nil {
+			entry.Status = "Error"
+			entry.Details = append(entry.Details, fmt.Sprintf("Failed to decrypt %s: %v", hashFilePath, err))
+			return false, entry, err
+		}
+
+		var dbHash DBHash
+		if err := json.Unmarshal(decryptedHashData, &dbHash); err != nil {
+			entry.Status = "Error"
+			entry.Details = append(entry.Details, fmt.Sprintf("Failed to parse %s: %v", hashFilePath, err))
+			return false, entry, err
+		}
+
+		// Verify the path matches
+		if dbHash.Path != dbPath {
+			detail := fmt.Sprintf("Path mismatch in %s\n  Stored: %s\n  Expected: %s", hashFilePath, dbHash.Path, dbPath)
+			entry.Details = append(entry.Details, detail)
+			fmt.Println(detail)
+			allMatch = false
+		}
+
+		// Calculate current hash of .db.json and compare
+		currentDBHash, err := calculateFileHash(dbPath)
+		if err != nil {
+			entry.Status = "Error"
+			entry.Details = append(entry.Details, fmt.Sprintf("Failed to calculate hash for %s: %v", dbPath, err))
+			return false, entry, err
+		}
+
+		if currentDBHash != dbHash.Hash {
+			detail := fmt.Sprintf("Hash mismatch for %s\n  Stored: %s\n  Current: %s", dbPath, dbHash.Hash, currentDBHash)
+			entry.Details = append(entry.Details, detail)
+			fmt.Println(detail)
+			allMatch = false
+		} else {
+			fmt.Printf("%s hash verified successfully\n", hashFilePath)
+		}
+	} else if os.IsNotExist(err) {
+		entry.Details = append(entry.Details, fmt.Sprintf("Warning: %s not found - cannot verify .db.json integrity", hashFilePath))
+		allMatch = false
+	} else {
+		entry.Status = "Error"
+		entry.Details = append(entry.Details, fmt.Sprintf("Failed to check %s existence: %v", hashFilePath, err))
+		return false, entry, err
+	}
+
+	// Step 2: Verify the .db.json contents (existing code)
 	decryptedData, err := decryptFile(key, dbPath)
 	if err != nil {
 		entry.Status = "Error"
@@ -142,12 +202,10 @@ func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 		return false, entry, err
 	}
 
-	storedPaths := make(map[string]string) // Map of path to hash
+	storedPaths := make(map[string]string)
 	for _, h := range storedHashes {
 		storedPaths[h.Path] = h.Hash
 	}
-
-	allMatch := true
 
 	// Check for missing files and hash mismatches
 	for path, storedHash := range storedPaths {
@@ -181,7 +239,7 @@ func verifyDirectory(key []byte, dirPath string) (bool, ReportEntry, error) {
 		if info.IsDir() && path != dirPath {
 			return filepath.SkipDir
 		}
-		if !info.IsDir() && path != dbPath {
+		if !info.IsDir() && path != dbPath && path != hashFilePath {
 			if _, exists := storedPaths[path]; !exists {
 				detail := fmt.Sprintf("Unauthorized new file detected: %s", path)
 				fmt.Println(detail)
@@ -228,8 +286,11 @@ func updateDirectory(key []byte, updateFile string) error {
 		}
 		dirPath := section.Name()
 		dbPath := filepath.Join(dirPath, ".db.json")
+		baseName := filepath.Base(dirPath)
+		hashFilePath := filepath.Join(dirPath, fmt.Sprintf(".%s.json", baseName))
 		fmt.Printf("Processing directory: %s\n", dirPath)
 
+		// Load existing .db.json if it exists
 		var existingHashes []FileHash
 		if _, err := os.Stat(dbPath); err == nil {
 			decryptedData, err := decryptFile(key, dbPath)
@@ -243,6 +304,7 @@ func updateDirectory(key []byte, updateFile string) error {
 			return fmt.Errorf("failed to check .db.json existence for %s: %v", dirPath, err)
 		}
 
+		// Update the hash map
 		hashMap := make(map[string]string)
 		for _, h := range existingHashes {
 			hashMap[h.Path] = h.Hash
@@ -262,7 +324,7 @@ func updateDirectory(key []byte, updateFile string) error {
 				fmt.Printf("Updated/Added file in hash database: %s\n", filePath)
 			}
 		}
-
+		// Create updated .db.json
 		var updatedHashes []FileHash
 		for path, hash := range hashMap {
 			updatedHashes = append(updatedHashes, FileHash{
@@ -284,6 +346,35 @@ func updateDirectory(key []byte, updateFile string) error {
 		fmt.Printf("Writing updated .db.json to %s\n", dbPath)
 		if err := os.WriteFile(dbPath, encryptedData, 0644); err != nil {
 			return fmt.Errorf("failed to write .db.json for %s: %v", dirPath, err)
+		}
+
+		// Step 2: Update the corresponding .apps.json
+		// Calculate the new hash of the encrypted .db.json
+		newDBHash, err := calculateFileHash(dbPath)
+		if err != nil {
+			return fmt.Errorf("failed to calculate new hash for %s: %v", dbPath, err)
+		}
+		// Create the updated DBHash structure
+		dbHash := DBHash{
+			Path: dbPath,
+			Hash: newDBHash,
+		}
+		// Marshal to JSON
+		hashJsonData, err := json.MarshalIndent(dbHash, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal hash JSON for %s: %v", hashFilePath, err)
+		}
+
+		// Encrypt the new .apps.json content
+		encryptedHashData, err := encryptFile(key, hashJsonData)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt hash data for %s: %v", hashFilePath, err)
+		}
+
+		// Write the updated .apps.json
+		fmt.Printf("Writing updated %s with new .db.json hash\n", hashFilePath)
+		if err := os.WriteFile(hashFilePath, encryptedHashData, 0644); err != nil {
+			return fmt.Errorf("failed to write %s: %v", hashFilePath, err)
 		}
 		fmt.Printf("Updated hash database for %s\n", dirPath)
 	}
@@ -378,7 +469,7 @@ func generatePDFReport(entries []ReportEntry, allValid bool) error {
 		pdf.Ln(8)
 
 		if len(entry.Details) > 0 {
-			pdf.Cell(0, 10, "Details:")
+			pdf.Cell(0, 10, "Verification Details:")
 			pdf.Ln(6)
 			for _, detail := range entry.Details {
 				pdf.MultiCell(0, 6, fmt.Sprintf("- %s", detail), "", "", false)
@@ -410,7 +501,21 @@ func generatePDFReport(entries []ReportEntry, allValid bool) error {
 	return pdf.OutputFileAndClose(outputPath)
 }
 
+func cleanupTempFiles() {
+	files := []string{"extracted_key.txt"}
+	for _, file := range files {
+		if err := os.Remove(file); err == nil || os.IsNotExist(err) {
+			continue
+		} else {
+			fmt.Printf("Warning: Failed to remove temporary file %s: %v\n", file, err)
+		}
+	}
+}
+
 func main() {
+	// Cleanup temp files on exit
+	defer cleanupTempFiles()
+
 	if len(os.Args) < 2 {
 		fmt.Println("Usage:")
 		fmt.Println("  integrityx verify <image-path>")
@@ -449,22 +554,55 @@ func main() {
 			"/sda1/boot/",
 		}
 
+		// Channel to collect results from goroutines
+		type Result struct {
+			Valid bool
+			Entry ReportEntry
+			Err   error
+		}
+		resultChan := make(chan Result, len(directories))
+		sem := make(chan struct{}, 2) // Limit to 2 concurrent goroutines
+
+		// Launch goroutines for each directory
+		for _, dir := range directories {
+			go func(dir string) {
+				sem <- struct{}{}        // Acquire semaphore
+				defer func() { <-sem }() // Release semaphore
+				fmt.Printf("\nVerifying directory: %s (in parallel)\n", dir)
+				valid, entry, err := verifyDirectory(key, dir)
+				resultChan <- Result{Valid: valid, Entry: entry, Err: err}
+			}(dir)
+		}
+
+		// Collect results
 		var reportEntries []ReportEntry
 		allValid := true
-		for _, dir := range directories {
-			fmt.Printf("\nVerifying directory: %s\n", dir)
-			valid, entry, err := verifyDirectory(key, dir)
-			if err != nil {
-				fmt.Printf("Error verifying %s: %v\n", dir, err)
-				reportEntries = append(reportEntries, entry)
+		for i := 0; i < len(directories); i++ {
+			res := <-resultChan
+			if res.Err != nil {
+				fmt.Printf("Error verifying %s: %v\n", res.Entry.Directory, res.Err)
 				allValid = false
-				continue
 			}
-			reportEntries = append(reportEntries, entry)
-			if !valid {
+			reportEntries = append(reportEntries, res.Entry)
+			if !res.Valid {
 				allValid = false
 			}
 		}
+		close(resultChan)
+		// for _, dir := range directories {
+		// 	fmt.Printf("\nVerifying directory: %s\n", dir)
+		// 	valid, entry, err := verifyDirectory(key, dir)
+		// 	if err != nil {
+		// 		fmt.Printf("Error verifying %s: %v\n", dir, err)
+		// 		reportEntries = append(reportEntries, entry)
+		// 		allValid = false
+		// 		continue
+		// 	}
+		// 	reportEntries = append(reportEntries, entry)
+		// 	if !valid {
+		// 		allValid = false
+		// 	}
+		// }
 
 		if allValid {
 			fmt.Println("\nAll directories verified successfully - no unauthorized changes or additions")
@@ -495,10 +633,36 @@ func main() {
 			return
 		}
 
-		if err := updateDirectory(key, *updateFile); err != nil {
-			fmt.Println("Error updating directories:", err)
+		cfg, err := ini.Load(*updateFile)
+		if err != nil {
+			fmt.Println("Error loading update.ini:", err)
 			return
 		}
+
+		sections := cfg.Sections()
+		resultChan := make(chan error, len(sections)-1) // -1 to exclude DEFAULT
+		for _, section := range sections {
+			if section.Name() == "DEFAULT" {
+				continue
+			}
+			go func(dirPath string) {
+				fmt.Printf("Processing directory: %s (in parallel)\n", dirPath)
+				err := updateDirectory(key, *updateFile) // Note: this updates all dirs; adjust if needed
+				resultChan <- err
+			}(section.Name())
+		}
+
+		for i := 0; i < len(sections)-1; i++ {
+			if err := <-resultChan; err != nil {
+				fmt.Println("Error updating directory:", err)
+				return
+			}
+		}
+		close(resultChan)
+		// if err := updateDirectory(key, *updateFile); err != nil {
+		// 	fmt.Println("Error updating directories:", err)
+		// 	return
+		// }
 		fmt.Println("Directory hash databases updated successfully")
 
 	case "ops":
